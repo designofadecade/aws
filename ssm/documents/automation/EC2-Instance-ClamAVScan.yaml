@@ -1,0 +1,139 @@
+description: |-
+  # EC2 Instance ClamAV Scan (AWS Linux 1 & 2)
+  - Create AMI
+  - Launch Instance
+  - Install ClamAV, Update Definitions Database
+  - Scan Instance, Write Output to CloudWatch & S3
+  - Terminate Instance 
+  - Delete Image
+schemaVersion: '0.3'
+parameters:
+  InstanceId:
+    type: String
+  InstanceType:
+    type: String
+  KeyName:
+    type: String
+  IamInstanceProfileArn:
+    type: String
+  SubnetId:
+    type: String
+  SecurityGroupIds:
+    type: StringList
+  LogGroupName:
+    type: String
+    default: ''
+  S3BucketName:
+    type: String
+    default: ''
+mainSteps:
+  - name: createImage
+    action: 'aws:createImage'
+    inputs:
+      InstanceId: '{{ InstanceId }}'
+      NoReboot: true
+      ImageDescription: 'ID - {{ InstanceId }}'
+      ImageName: 'ID - {{ InstanceId }}'
+  - name: getInstanceName
+    action: 'aws:executeAwsApi'
+    inputs:
+      Service: ec2
+      Api: DescribeTags
+      Filters:
+        - Name: resource-id
+          Values:
+            - '{{ InstanceId }}'
+        - Name: key
+          Values:
+            - Name
+    outputs:
+      - Name: InstanceName
+        Selector: '$.Tags[0].Value'
+        Type: String
+  - name: createTags
+    action: 'aws:createTags'
+    maxAttempts: 3
+    onFailure: Abort
+    inputs:
+      ResourceType: EC2
+      ResourceIds:
+        - '{{ createImage.ImageId }}'
+      Tags:
+        - Key: Name
+          Value: '{{ getInstanceName.InstanceName }}'
+  - name: launchInstance
+    action: 'aws:runInstances'
+    maxAttempts: 3
+    timeoutSeconds: 1200
+    onFailure: Abort
+    inputs:
+      ImageId: '{{ createImage.ImageId }}'
+      InstanceType: '{{ InstanceType }}'
+      MinInstanceCount: 1
+      MaxInstanceCount: 1
+      KeyName: '{{ KeyName }}'
+      IamInstanceProfileArn: '{{ IamInstanceProfileArn }}'
+      SecurityGroupIds:
+        - '{{ SecurityGroupIds }}'
+      SubnetId: '{{ SubnetId }}'
+      TagSpecifications:
+        - ResourceType: instance
+          Tags:
+            - Key: Name
+              Value: 'ClamAV Scan - {{ getInstanceName.InstanceName }}'
+            - Key: Environment
+              Value: ClamAVScan
+      UserData: IyEvYmluL2Jhc2gKY2QgL3RtcApzdWRvIHl1bSBpbnN0YWxsIC15IGh0dHBzOi8vczMuYW1hem9uYXdzLmNvbS9lYzItZG93bmxvYWRzLXdpbmRvd3MvU1NNQWdlbnQvbGF0ZXN0L2xpbnV4X2FtZDY0L2FtYXpvbi1zc20tYWdlbnQucnBtCmlmIGdyZXAgLXEgIkFtYXpvbiBMaW51eCByZWxlYXNlIDIiICIvZXRjL3N5c3RlbS1yZWxlYXNlIjsgdGhlbiBzdWRvIHN5c3RlbWN0bCBlbmFibGUgYW1hem9uLXNzbS1hZ2VudDsgZmk7CmlmIGdyZXAgLXEgIkFtYXpvbiBMaW51eCByZWxlYXNlIDIiICIvZXRjL3N5c3RlbS1yZWxlYXNlIjsgdGhlbiBzdWRvIHN5c3RlbWN0bCBzdGFydCBhbWF6b24tc3NtLWFnZW50OyBmaTsKaWYgZ3JlcCAtcSAiQW1hem9uIExpbnV4IEFNSSByZWxlYXNlIiAiL2V0Yy9zeXN0ZW0tcmVsZWFzZSI7IHRoZW4gc3VkbyBzdGFydCBhbWF6b24tc3NtLWFnZW50OyBmaTs=
+  - name: verifyInstanceRunning
+    action: 'aws:assertAwsResourceProperty'
+    inputs:
+      Service: ec2
+      Api: DescribeInstances
+      InstanceIds:
+        - '{{ launchInstance.InstanceIds }}'
+      PropertySelector: '$.Reservations[0].Instances[0].State.Name'
+      DesiredValues:
+        - running
+  - name: installClamAV
+    action: 'aws:runCommand'
+    inputs:
+      DocumentName: AWS-RunShellScript
+      InstanceIds:
+        - '{{ launchInstance.InstanceIds }}'
+      Parameters:
+        executionTimeout: '10800'
+        commands:
+          - if grep -q "Amazon Linux release 2" "/etc/system-release"; then sudo amazon-linux-extras install epel -y; fi;
+          - sudo yum install clamav -y
+          - sudo freshclam
+  - name: scanWithClamAV
+    action: 'aws:runCommand'
+    inputs:
+      DocumentName: AWS-RunShellScript
+      InstanceIds:
+        - '{{ launchInstance.InstanceIds }}'
+      Parameters:
+        commands:
+          - sudo clamscan -r -i / --exclude-dir="^/sys"
+      CloudWatchOutputConfig:
+        CloudWatchLogGroupName: '{{ LogGroupName }}'
+        CloudWatchOutputEnabled: true
+      OutputS3BucketName: '{{ S3BucketName }}'
+  - name: terminatInstance
+    action: 'aws:changeInstanceState'
+    maxAttempts: 3
+    timeoutSeconds: 3600
+    onFailure: Abort
+    inputs:
+      InstanceIds:
+        - '{{ launchInstance.InstanceIds }}'
+      CheckStateOnly: false
+      Force: true
+      DesiredState: terminated
+  - name: deleteImage
+    action: 'aws:deleteImage'
+    maxAttempts: 3
+    timeoutSeconds: 180
+    onFailure: Abort
+    inputs:
+      ImageId: '{{createImage.ImageId}}'
